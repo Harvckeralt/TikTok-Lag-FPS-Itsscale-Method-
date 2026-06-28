@@ -3,33 +3,59 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FFmpeg Timestamp Scaler (Single Thread)</title>
+    <title>FFmpeg Timestamp Scaler</title>
     <style>
         body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; background: #fff; color: #333; }
         .box { border: 1px solid #ccc; padding: 20px; border-radius: 8px; background: #fafafa; }
-        .log { background: #000; color: #0f0; padding: 15px; font-family: monospace; height: 200px; overflow-y: auto; border-radius: 4px; font-size: 12px; margin-top: 15px;}
-        button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-size: 16px;}
+        .log { background: #000; color: #0f0; padding: 15px; font-family: monospace; height: 200px; overflow-y: auto; border-radius: 4px; font-size: 12px; margin-top: 15px; white-space: pre-wrap; }
+        button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-size: 16px; }
         button:disabled { background: #ccc; cursor: not-allowed; }
         .progress { margin: 10px 0; font-weight: bold; color: #333; }
+        .section { margin-top: 20px; padding-top: 15px; border-top: 1px solid #ddd; }
+        .fps-row { display: flex; align-items: center; gap: 12px; }
+        .fps-row input[type="range"] { flex: 1; }
+        .fps-label { min-width: 90px; font-weight: bold; }
+        .warning { font-size: 13px; color: #a15c00; background: #fff3cd; border: 1px solid #ffe08a; padding: 8px 10px; border-radius: 4px; margin-top: 8px; display: none; }
+        .checkbox-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        label { cursor: pointer; }
+        a button { width: 100%; }
     </style>
 </head>
 <body>
 
     <h2>FFmpeg .mp4 Timestamp Scaler</h2>
-    <p>Bypasses Chrome security blocks by running in single-thread compatibility mode.</p>
+    <p>Stretches or compresses a video's internal timestamps (no re-encoding required for the base operation) and optionally interpolates extra frames for smoother playback.</p>
 
     <div class="box">
         <input type="file" id="video-input" accept="video/mp4"><br><br>
-        <button id="process-btn" disabled>Processing...</button>
-        <div class="progress" id="status-text">Loading single-thread core modules...</div>
-        <div class="log" id="log-output">System starting...</div>
-        <br>
-        <a id="download-link" style="display:none;" download="output.mp4"><button style="background:#28a745;">Download Optimized Video</button></a>
+
+        <div class="section">
+            <div class="checkbox-row">
+                <input type="checkbox" id="interp-enable">
+                <label for="interp-enable">Enable frame interpolation</label>
+            </div>
+            <div id="interp-controls" style="display:none;">
+                <div class="fps-row">
+                    <span class="fps-label" id="fps-label">120 fps</span>
+                    <input type="range" id="fps-slider" min="0" max="2" step="1" value="1">
+                </div>
+                <div style="font-size: 12px; color: #666; margin-top: 4px;">60 fps — 120 fps — 240 fps</div>
+                <div class="warning" id="fps-warning"></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <button id="process-btn" disabled>Loading FFmpeg...</button>
+            <div class="progress" id="status-text">Loading core modules...</div>
+            <div class="log" id="log-output">System starting...</div>
+            <br>
+            <a id="download-link" style="display:none;" download="output.mp4"><button style="background:#28a745;">Download Result</button></a>
+        </div>
     </div>
 
     <script type="module">
-        import { FFmpeg } from 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js';
-        import { fetchFile } from 'https://unpkg.com/@ffmpeg/util@0.12.4/dist/esm/index.js';
+        import { FFmpeg } from 'https://cdnjs.cloudflare.com/ajax/libs/ffmpeg/0.12.10/index.js';
+        import { fetchFile } from 'https://cdnjs.cloudflare.com/ajax/libs/ffmpeg/0.12.10/index.js';
 
         const ffmpeg = new FFmpeg();
         const inputEl = document.getElementById('video-input');
@@ -38,106 +64,184 @@
         const logEl = document.getElementById('log-output');
         const downloadLink = document.getElementById('download-link');
 
-        const TARGET_MAX_SECONDS = 599;
+        const interpEnableEl = document.getElementById('interp-enable');
+        const interpControlsEl = document.getElementById('interp-controls');
+        const fpsSliderEl = document.getElementById('fps-slider');
+        const fpsLabelEl = document.getElementById('fps-label');
+        const fpsWarningEl = document.getElementById('fps-warning');
+
+        const TARGET_MAX_SECONDS = 599; // keep clear of the 10-minute mark
+        const FPS_STEPS = [60, 120, 240];
+
+        let ready = false;
 
         function log(message) {
             logEl.innerText += message + '\n';
             logEl.scrollTop = logEl.scrollHeight;
         }
 
+        function currentFps() {
+            return FPS_STEPS[parseInt(fpsSliderEl.value, 10)];
+        }
+
+        function updateFpsUI() {
+            const fps = currentFps();
+            fpsLabelEl.innerText = `${fps} fps`;
+
+            if (fps === 60) {
+                fpsWarningEl.style.display = 'none';
+            } else if (fps === 120) {
+                fpsWarningEl.innerText = 'Moderate processing time. Some motion artifacts possible in fast scenes.';
+                fpsWarningEl.style.display = 'block';
+            } else {
+                fpsWarningEl.innerText = 'Higher fps = much longer processing time and a higher chance of visible interpolation artifacts (warping, ghosting) on fast motion.';
+                fpsWarningEl.style.display = 'block';
+            }
+        }
+
+        interpEnableEl.addEventListener('change', () => {
+            interpControlsEl.style.display = interpEnableEl.checked ? 'block' : 'none';
+        });
+        fpsSliderEl.addEventListener('input', updateFpsUI);
+        updateFpsUI();
+
         async function init() {
             try {
                 ffmpeg.on('log', ({ message }) => {
-                    if (!message.includes('frame=') && !message.includes('size=')) {
+                    if (!message.includes('frame=') && !message.includes('bitrate=')) {
                         log(message);
                     }
                 });
 
-                // Crucial fix: Force loading the single-thread build of FFmpeg which removes SharedArrayBuffer requirement
                 await ffmpeg.load({
-                    coreURL: 'https://unpkg.com/@ffmpeg/core-st@0.12.10/dist/esm/ffmpeg-core.js'
+                    coreURL: 'https://cdnjs.cloudflare.com/ajax/libs/ffmpeg-core/0.12.6/ffmpeg-core.js',
+                    wasmURL: 'https://cdnjs.cloudflare.com/ajax/libs/ffmpeg-core/0.12.6/ffmpeg-core.wasm'
                 });
 
-                statusEl.innerText = "FFmpeg Core Ready! Select your MP4 file.";
-                log("System initialized in Single-Thread safety mode.");
-                
-                inputEl.addEventListener('change', () => { 
-                    if(inputEl.files.length > 0) {
+                ready = true;
+                statusEl.innerText = "FFmpeg ready. Select your MP4 file.";
+                log("Initialized.");
+
+                inputEl.addEventListener('change', () => {
+                    if (inputEl.files.length > 0) {
                         buttonEl.innerText = "Process Video";
-                        buttonEl.disabled = false; 
+                        buttonEl.disabled = false;
                     }
                 });
             } catch (err) {
-                statusEl.innerText = "Failed initialization.";
+                statusEl.innerText = "Failed to initialize FFmpeg.";
                 log("Fatal: " + err.message);
             }
         }
 
+        // Probing duration via ffmpeg.exec(['-i', file]) throws in ffmpeg.wasm 0.12.x
+        // because there's no output file, so we capture it from the log stream instead
+        // and swallow the expected error.
         async function getVideoDuration(filename) {
             let duration = 0;
-            // Listen specifically to the duration log output from FFmpeg
             const durationListener = ({ message }) => {
-                const match = message.match(/Duration: (\d+):(\d+):(\d+\.\d+)/);
+                const match = message.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
                 if (match) {
-                    const hours = parseInt(match[1]);
-                    const minutes = parseInt(match[2]);
+                    const hours = parseInt(match[1], 10);
+                    const minutes = parseInt(match[2], 10);
                     const seconds = parseFloat(match[3]);
                     duration = (hours * 3600) + (minutes * 60) + seconds;
                 }
             };
-            
+
             ffmpeg.on('log', durationListener);
-            await ffmpeg.exec(['-i', filename]);
-            // Clean up listener
+            try {
+                await ffmpeg.exec(['-i', filename]);
+            } catch (e) {
+                // expected: ffmpeg exits non-zero with no output file specified
+            }
             ffmpeg.off('log', durationListener);
             return duration;
         }
 
         async function processVideo() {
+            if (!ready) return;
             buttonEl.disabled = true;
             downloadLink.style.display = 'none';
             const file = inputEl.files[0];
-            if (!file) return;
-
-            statusEl.innerText = "Writing source file to virtual disk...";
-            await ffmpeg.writeFile('input.mp4', await fetchFile(file));
-
-            statusEl.innerText = "Reading input metadata values...";
-            const origDuration = await getVideoDuration('input.mp4');
-            log(`Detected exact length: ${origDuration} seconds`);
-
-            if (origDuration <= 0 || origDuration >= TARGET_MAX_SECONDS) {
-                statusEl.innerText = "Error tracking file timeline.";
-                log("Aborted: Video duration is problematic or already longer than 9m 59s.");
+            if (!file) {
+                buttonEl.disabled = false;
                 return;
             }
 
-            const maxItsScale = TARGET_MAX_SECONDS / origDuration;
-            log(`Calculated precise target scale multiplier: ${maxItsScale}`);
+            try {
+                statusEl.innerText = "Writing source file to virtual disk...";
+                await ffmpeg.writeFile('input.mp4', await fetchFile(file));
 
-            statusEl.innerText = "Processing video stream adjustments...";
-            
-            await ffmpeg.exec([
-                '-itsscale', maxItsScale.toString(),
-                '-i', 'input.mp4',
-                '-c', 'copy',
-                '-video_track_timescale', '90000',
-                'output.mp4'
-            ]);
+                statusEl.innerText = "Reading input metadata...";
+                const origDuration = await getVideoDuration('input.mp4');
+                log(`Detected length: ${origDuration.toFixed(2)}s`);
 
-            statusEl.innerText = "Generating asset download pointer...";
-            const data = await ffmpeg.readFile('output.mp4');
-            const videoBlob = new Blob([data.buffer], { type: 'video/mp4' });
-            const url = URL.createObjectURL(videoBlob);
+                if (origDuration <= 0) {
+                    statusEl.innerText = "Could not read video duration.";
+                    log("Aborted: duration detection failed.");
+                    buttonEl.disabled = false;
+                    return;
+                }
+                if (origDuration >= TARGET_MAX_SECONDS) {
+                    statusEl.innerText = "Video is already 9m59s or longer.";
+                    log("Aborted: nothing to do, video already at/above target ceiling.");
+                    buttonEl.disabled = false;
+                    return;
+                }
 
-            downloadLink.href = url;
-            downloadLink.style.display = 'inline-block';
-            statusEl.innerText = "Execution complete!";
-            log("Process finished successfully.");
+                const itsScale = TARGET_MAX_SECONDS / origDuration;
+                log(`Timestamp scale multiplier: ${itsScale.toFixed(6)}`);
 
-            // Clear virtual disk spaces
-            await ffmpeg.deleteFile('input.mp4');
-            await ffmpeg.deleteFile('output.mp4');
+                const useInterp = interpEnableEl.checked;
+                const targetFps = currentFps();
+
+                if (!useInterp) {
+                    // Fast path: stream copy, no re-encode needed.
+                    statusEl.innerText = "Rescaling timestamps (stream copy)...";
+                    await ffmpeg.exec([
+                        '-itsscale', itsScale.toString(),
+                        '-i', 'input.mp4',
+                        '-c', 'copy',
+                        '-video_track_timescale', '90000',
+                        'output.mp4'
+                    ]);
+                } else {
+                    // Interpolation requires a full re-encode, so it's done in one pass
+                    // together with the timestamp scale to avoid double-encoding.
+                    statusEl.innerText = `Re-encoding with motion interpolation to ${targetFps}fps (this can take a while)...`;
+                    log(`Interpolating to ${targetFps}fps via minterpolate — slower and more prone to artifacts at higher fps.`);
+                    await ffmpeg.exec([
+                        '-itsscale', itsScale.toString(),
+                        '-i', 'input.mp4',
+                        '-vf', `minterpolate=fps=${targetFps}:mi_mode=mci:mc_mode=aobmc:vsbmc=1`,
+                        '-c:v', 'libx264',
+                        '-preset', 'medium',
+                        '-crf', '20',
+                        '-c:a', 'copy',
+                        '-video_track_timescale', '90000',
+                        'output.mp4'
+                    ]);
+                }
+
+                statusEl.innerText = "Reading output file...";
+                const data = await ffmpeg.readFile('output.mp4');
+                const videoBlob = new Blob([data.buffer], { type: 'video/mp4' });
+                const url = URL.createObjectURL(videoBlob);
+
+                downloadLink.href = url;
+                downloadLink.style.display = 'inline-block';
+                statusEl.innerText = "Done!";
+                log("Process finished successfully.");
+
+                await ffmpeg.deleteFile('input.mp4');
+                await ffmpeg.deleteFile('output.mp4');
+            } catch (err) {
+                statusEl.innerText = "Processing failed.";
+                log("Error: " + err.message);
+            } finally {
+                buttonEl.disabled = false;
+            }
         }
 
         buttonEl.addEventListener('click', processVideo);
