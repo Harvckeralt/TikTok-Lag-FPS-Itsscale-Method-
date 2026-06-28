@@ -3,10 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FFmpeg Timestamp Scaler</title>
-    <script src="https://cdn.jsdelivr.net/npm/coi-serviceworker@0.1.7/coi-serviceworker.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.0/dist/ffmpeg.min.js"></script>
-    
+    <title>FFmpeg Timestamp Scaler (Single Thread)</title>
     <style>
         body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; background: #fff; color: #333; }
         .box { border: 1px solid #ccc; padding: 20px; border-radius: 8px; background: #fafafa; }
@@ -19,22 +16,22 @@
 <body>
 
     <h2>FFmpeg .mp4 Timestamp Scaler</h2>
-    <p>Finds the absolute maximum <code>-itsscale</code> possible without letting the video exceed <strong>9m 59s (599 seconds)</strong>.</p>
+    <p>Bypasses Chrome security blocks by running in single-thread compatibility mode.</p>
 
     <div class="box">
         <input type="file" id="video-input" accept="video/mp4"><br><br>
-        <button id="process-btn" disabled>Load FFmpeg & Process</button>
-        <div class="progress" id="status-text">Initializing scripts...</div>
-        <div class="log" id="log-output">System idle. Ready...</div>
+        <button id="process-btn" disabled>Processing...</button>
+        <div class="progress" id="status-text">Loading single-thread core modules...</div>
+        <div class="log" id="log-output">System starting...</div>
         <br>
         <a id="download-link" style="display:none;" download="output.mp4"><button style="background:#28a745;">Download Optimized Video</button></a>
     </div>
 
-    <script>
-        // Use older, infinitely more stable Global Object bindings for client browser execution
-        const { createFFmpeg, fetchFile } = FFmpeg;
-        const ffmpeg = createFFmpeg({ log: true });
+    <script type="module">
+        import { FFmpeg } from 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js';
+        import { fetchFile } from 'https://unpkg.com/@ffmpeg/util@0.12.4/dist/esm/index.js';
 
+        const ffmpeg = new FFmpeg();
         const inputEl = document.getElementById('video-input');
         const buttonEl = document.getElementById('process-btn');
         const statusEl = document.getElementById('status-text');
@@ -50,28 +47,36 @@
 
         async function init() {
             try {
-                statusEl.innerText = "Loading WebAssembly core modules...";
-                
-                ffmpeg.setLogger(({ type, message }) => {
+                ffmpeg.on('log', ({ message }) => {
                     if (!message.includes('frame=') && !message.includes('size=')) {
-                        log(`[${type}] ${message}`);
+                        log(message);
                     }
                 });
 
-                await ffmpeg.load();
-                statusEl.innerText = "FFmpeg Loaded! Choose an MP4 file to begin.";
-                inputEl.addEventListener('change', () => { buttonEl.disabled = false; });
+                // Crucial fix: Force loading the single-thread build of FFmpeg which removes SharedArrayBuffer requirement
+                await ffmpeg.load({
+                    coreURL: 'https://unpkg.com/@ffmpeg/core-st@0.12.10/dist/esm/ffmpeg-core.js'
+                });
+
+                statusEl.innerText = "FFmpeg Core Ready! Select your MP4 file.";
+                log("System initialized in Single-Thread safety mode.");
+                
+                inputEl.addEventListener('change', () => { 
+                    if(inputEl.files.length > 0) {
+                        buttonEl.innerText = "Process Video";
+                        buttonEl.disabled = false; 
+                    }
+                });
             } catch (err) {
-                statusEl.innerText = "Critical Loading Error. Read system log below.";
-                log("Error: " + err.message);
-                log("If using Safari/Brave, switch to Chrome or Firefox. Cross-Origin isolation may have failed.");
+                statusEl.innerText = "Failed initialization.";
+                log("Fatal: " + err.message);
             }
         }
 
         async function getVideoDuration(filename) {
-            // Write a small script to grab duration out of the log system because ffprobe is separate in v0.11
             let duration = 0;
-            ffmpeg.setLogger(({ message }) => {
+            // Listen specifically to the duration log output from FFmpeg
+            const durationListener = ({ message }) => {
                 const match = message.match(/Duration: (\d+):(\d+):(\d+\.\d+)/);
                 if (match) {
                     const hours = parseInt(match[1]);
@@ -79,10 +84,12 @@
                     const seconds = parseFloat(match[3]);
                     duration = (hours * 3600) + (minutes * 60) + seconds;
                 }
-            });
+            };
             
-            // Running a dummy pass to extract metadata fields safely
-            await ffmpeg.run('-i', filename);
+            ffmpeg.on('log', durationListener);
+            await ffmpeg.exec(['-i', filename]);
+            // Clean up listener
+            ffmpeg.off('log', durationListener);
             return duration;
         }
 
@@ -92,55 +99,49 @@
             const file = inputEl.files[0];
             if (!file) return;
 
-            statusEl.innerText = "Mounting video file to WebAssembly file system...";
-            ffmpeg.FS('writeFile', 'input.mp4', await fetchFile(file));
+            statusEl.innerText = "Writing source file to virtual disk...";
+            await ffmpeg.writeFile('input.mp4', await fetchFile(file));
 
-            statusEl.innerText = "Analyzing duration properties...";
+            statusEl.innerText = "Reading input metadata values...";
             const origDuration = await getVideoDuration('input.mp4');
-            
-            // Re-hook logger to ignore noise
-            ffmpeg.setLogger(({ message }) => { log(message); });
-
-            log(`Detected File Duration: ${origDuration} seconds.`);
+            log(`Detected exact length: ${origDuration} seconds`);
 
             if (origDuration <= 0 || origDuration >= TARGET_MAX_SECONDS) {
-                statusEl.innerText = "Execution stopped.";
-                log("Error: File is either invalid or already over 9m 59s.");
+                statusEl.innerText = "Error tracking file timeline.";
+                log("Aborted: Video duration is problematic or already longer than 9m 59s.");
                 return;
             }
 
-            let maxItsScale = TARGET_MAX_SECONDS / origDuration;
-            log(`Calculated max processing value: ${maxItsScale}`);
+            const maxItsScale = TARGET_MAX_SECONDS / origDuration;
+            log(`Calculated precise target scale multiplier: ${maxItsScale}`);
 
-            statusEl.innerText = "Processing scaling layout via FFmpeg...";
+            statusEl.innerText = "Processing video stream adjustments...";
             
-            await ffmpeg.run(
+            await ffmpeg.exec([
                 '-itsscale', maxItsScale.toString(),
                 '-i', 'input.mp4',
                 '-c', 'copy',
                 '-video_track_timescale', '90000',
                 'output.mp4'
-            );
+            ]);
 
-            statusEl.innerText = "Finalizing data array...";
-            const data = ffmpeg.FS('readFile', 'output.mp4');
-
+            statusEl.innerText = "Generating asset download pointer...";
+            const data = await ffmpeg.readFile('output.mp4');
             const videoBlob = new Blob([data.buffer], { type: 'video/mp4' });
             const url = URL.createObjectURL(videoBlob);
-            
+
             downloadLink.href = url;
             downloadLink.style.display = 'inline-block';
-            statusEl.innerText = "Done! Ready for download.";
+            statusEl.innerText = "Execution complete!";
+            log("Process finished successfully.");
 
-            // Wipe local memory structure
-            ffmpeg.FS('unlink', 'input.mp4');
-            ffmpeg.FS('unlink', 'output.mp4');
+            // Clear virtual disk spaces
+            await ffmpeg.deleteFile('input.mp4');
+            await ffmpeg.deleteFile('output.mp4');
         }
 
-        // Delay execution briefly to let service worker negotiate domain headers safely
-        window.addEventListener('load', () => {
-            setTimeout(init, 1000);
-        });
+        buttonEl.addEventListener('click', processVideo);
+        init();
     </script>
 </body>
 </html>
