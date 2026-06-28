@@ -1,1 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FFmpeg Timestamp Scaler</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/coi-serviceworker/0.1.7/coi-serviceworker.min.js"></script>
+    
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; line-height: 1.6; }
+        .box { border: 1px solid #ccc; padding: 20px; border-radius: 8px; background: #fafafa; }
+        .log { background: #000; color: #0f0; padding: 15px; font-family: monospace; height: 200px; overflow-y: auto; border-radius: 4px; font-size: 12px; margin-top: 15px;}
+        button { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-size: 16px;}
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .progress { margin: 10px 0; font-weight: bold; color: #333; }
+    </style>
+</head>
+<body>
+
+    <h2>FFmpeg .mp4 Timestamp Scaler</h2>
+    <p>Finds the absolute maximum <code>-itsscale</code> possible without letting the video exceed <strong>9m 59s (599 seconds)</strong>.</p>
+
+    <div class="box">
+        <input type="file" id="video-input" accept="video/mp4"><br><br>
+        <button id="process-btn" disabled>Load FFmpeg & Process</button>
+        <div class="progress" id="status-text">Loading FFmpeg WebAssembly libraries...</div>
+        <div class="log" id="log-output">System idle. Ready to load...</div>
+        <br>
+        <a id="download-link" style="display:none;" download="output.mp4"><button style="background:#28a745;">Download Optimized Video</button></a>
+    </div>
+
+    <script type="module">
+        import { FFmpeg } from 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js';
+        import { fetchFile } from 'https://unpkg.com/@ffmpeg/util@0.12.4/dist/esm/index.js';
+
+        const ffmpeg = new FFmpeg();
+        const inputEl = document.getElementById('video-input');
+        const buttonEl = document.getElementById('process-btn');
+        const statusEl = document.getElementById('status-text');
+        const logEl = document.getElementById('log-output');
+        const downloadLink = document.getElementById('download-link');
+
+        const TARGET_MAX_SECONDS = 599; // 9 minutes 59 seconds
+
+        function log(message) {
+            logEl.innerText += message + '\n';
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // Initialize FFmpeg
+        async function init() {
+            try {
+                ffmpeg.on('log', ({ message }) => {
+                    // Filter noise to prevent massive browser slowdowns
+                    if (!message.includes('frame=') && !message.includes('size=')) {
+                        log(message);
+                    }
+                });
+                
+                await ffmpeg.load({
+                    coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm/ffmpeg-core.js',
+                });
+                
+                statusEl.innerText = "FFmpeg loaded successfully! Select an MP4 file.";
+                inputEl.addEventListener('change', () => { buttonEl.disabled = false; });
+            } catch (err) {
+                statusEl.innerText = "Error loading FFmpeg. Ensure your browser supports SharedArrayBuffer.";
+                log(err.message);
+            }
+        }
+
+        async function getVideoDuration(filename) {
+            // Standard trick to extract metadata duration via ffprobe proxy execution
+            await ffmpeg.ffprobe(['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', filename, '-o', 'duration.txt']);
+            const data = await ffmpeg.readFile('duration.txt');
+            const durationStr = new TextDecoder().decode(data).trim();
+            return parseFloat(durationStr);
+        }
+
+        async function processVideo() {
+            buttonEl.disabled = true;
+            downloadLink.style.display = 'none';
+            const file = inputEl.files[0];
+            if (!file) return;
+
+            statusEl.innerText = "Reading file into memory system...";
+            log(`Loading file: ${file.name}`);
+            await ffmpeg.writeFile('input.mp4', await fetchFile(file));
+
+            statusEl.innerText = "Analyzing original video duration...";
+            const origDuration = await getVideoDuration('input.mp4');
+            log(`Original video duration: ${origDuration.toFixed(2)} seconds`);
+
+            if (origDuration >= TARGET_MAX_SECONDS) {
+                statusEl.innerText = "Error!";
+                log("The input file is already equal to or longer than 9m 59s. Cannot upscale timestamps.");
+                return;
+            }
+
+            // High precision calculation for the maximum limit
+            let maxItsScale = TARGET_MAX_SECONDS / origDuration;
+            log(`Theoretical maximum limit calculated: ${maxItsScale}`);
+
+            let passes = 0;
+            let success = false;
+            let finalScale = maxItsScale;
+
+            // Run an optimizing safety-check loop in case stream padding pushes duration over boundaries
+            while (passes < 3 && !success) {
+                passes++;
+                statusEl.innerText = `Testing with itsscale: ${finalScale.toFixed(4)} (Pass ${passes})...`;
+                log(`Executing scaling process with scale value: ${finalScale}`);
+
+                await ffmpeg.exec([
+                    '-itsscale', finalScale.toString(),
+                    '-i', 'input.mp4',
+                    '-c', 'copy',
+                    '-video_track_timescale', '90000',
+                    'output.mp4'
+                ]);
+
+                // Check actual output file duration
+                const resultDuration = await getVideoDuration('output.mp4');
+                log(`Resulting duration from pass ${passes}: ${resultDuration.toFixed(2)} seconds`);
+
+                if (resultDuration <= TARGET_MAX_SECONDS) {
+                    success = true;
+                    log(`Success! Safe scale found.`);
+                } else {
+                    // Backoff slightly if the file slightly exceeded constraints due to container overhead
+                    log(`Warning: Exceeded 599s threshold. Scaling down and retrying...`);
+                    finalScale = finalScale * 0.99; 
+                    await ffmpeg.deleteFile('output.mp4');
+                }
+            }
+
+            statusEl.innerText = "Exporting completed file...";
+            const finalData = await ffmpeg.readFile('output.mp4');
+            const videoBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
+            const url = URL.createObjectURL(videoBlob);
+            
+            downloadLink.href = url;
+            downloadLink.style.display = 'inline-block';
+            statusEl.innerText = `Completed! Optimal scale used: ${finalScale.toFixed(4)}`;
+            
+            // Clean virtual memory
+            await ffmpeg.deleteFile('input.mp4');
+            await ffmpeg.deleteFile('output.mp4');
+            await ffmpeg.deleteFile('duration.txt');
+        }
+
+        buttonEl.addEventListener('click', processVideo);
+        init();
+    </script>
+</body>
+</html>
 
